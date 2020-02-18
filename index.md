@@ -9,9 +9,9 @@ layout: default
   MathJax.Hub.Config({
     tex2jax: {
       inlineMath: [['$', '$'], ['\\(', '\\)']],
-      processEscapes: true	
+      processEscapes: true
     }
-  }); 
+  });
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML" type="text/javascript">
 </script>
@@ -287,4 +287,103 @@ consistent with Akka's definition of component and message flows:
   be yielded before `f2` for any `BundlingFlow` that uses `c`. This is the default
   behavior for a `BundlingFlow`
 
-# "Fold-Unfolding"
+# Metamorphing, a.k.a. "Fold-Unfolding"
+
+`MetamorphingFlow[In, Out, S <: BladderStatus]` is the underlying "proto-component" used to create
+many different kinds of `Flow[In, Out, NotUsed]` that act intelligently under backpressure. The `PrioritizingFlow`, `ReducingFlow` and `BundlingFlow` described above are all special cases of `MetamorphingFlow`.
+
+A `MetamorphingFlow` gets its name from the functional concept upon which it is based:
+the *metamorphism* (the logical dual of a *[hylomorphism](https://en.wikipedia.org/wiki/Hylomorphism_%28computer_science%29)*).
+A metamorphism is a function that maps a sequence of `A` values to a sequence of `B` values (not
+necessarily the same length) through an intermediate single object of type `S`. This is basically a
+2-step process:
+
+* The sequence of `A` values gets "folded" into a single `S` object
+* The single `S` object is then "unfolded" into a sequence of `B` objects
+
+`MetamorphingFlow` is a streaming version of this concept. Four parameters are required to create one:
+
+* An `initial` value of type `S`, used as the flow's initial internal state. `S` must implement a trait `BladderStatus`; more on this simple trait below.
+* A `folding` function of type `(A, S) => S`
+* An `unfolding` function of type `(S) => (B, S)`
+* An `OverflowStrategy`. The conditions triggering buffer overflow (and underflow) conditions are defined in terms of the trait `BladderStatus`, and are described in detail below.
+
+Each `In` message received from upstream is folded into the `S` value using the `folding`
+function. Independently, whenever downstream signals demand the `unfolding` function is
+used to produce an `Out` element, which is then yielded downstream.
+
+## `BladderStatus`: Full, Empty, or Filling
+The `S` object must be able to indicate when it represents a *full* or *empty* state, which is what the `BladderStatus` trait defines. When *full* the `S` object cannot accumulate additional `In` values. When empty the `S` object cannot produce any `Out` elements. Note that *full* and *empty* are mutually exclusive. When neither *full* nor *empty*, an `S` object is *filling*.
+
+For example, when using a finite-length queue as the `S` type:
+
+* The queue is *full* when it has **n** elements
+* The queue is *empty* when it has 0 elements
+* Otherwise the queue is *filling*
+
+In code these states are represented by `BladderState.Full`, `BladderState.Empty` and `BladderState.Filling`.
+
+The `BladderStatus` trait must be implemented by `S` types. This trait is defined like so:
+
+```
+trait BladderStatus {
+  def bladderState: BladderState
+}
+```
+
+## Example: Prioritizing
+
+Here's a quick description how to implement `PrioritizingFlow[A]` using `MetamorphingFlow[In, Out, S <: BladderStatus]`.
+
+We assume `In =:= Out =:= A`, because this kind of flow emits the same type of elements that it receives.
+
+We define `S` as a simple wrapper around a `List`, which also implements the `BladderStatus` trait. The list will be ordered using `ordering: Ordering[A]`, one of the required parameters to create a `PrioritizingFlow`:
+
+```
+case class BladderList[A](maxEls: Int, list: List[A]) {
+  override def bladderState: BladderState = list.size match {
+    case 0 => BladderState.Empty
+    case maxEls => BladderState.Full
+    case _ => BladderState.Filling
+  }
+}
+```
+
+This means `S =:= BladderList`.
+
+The `folding` function appends the inbound element to the internal list, sorting using `ordering`. The `unfolding` function yields the first element of the internal list and the tail of the list as the new internal state.
+
+```
+def folding(el: A, state: BladderList[A]): BladderList[A] =
+    state.copy(list = (state.list :+ el).sorted(ordering))
+
+def unfolding(state: BladderList[A]): (A, BladderList[A]) =
+  (state.head, state.copy(list = list.tail))
+```
+
+Note that there's no need to test for *full* or *empty* state conditions in the `folding` and `unfolding` method implementations. `MetamorphingFlow` performs these tests automatically immediately after receiving or emitting elements. This means the `folding` and `unfolding` functions will only be called when the conditions are proper.
+
+The full implementation of `PrioritizingFlow` then would look something like below. (Note that this is a simplified version of how `PriorizingFlow` is actually implemented in `akka-stream-bladder`.)
+
+```
+object PrioritizingFlow {
+
+  case class BladderList[A](maxEls: Int, list: List[A]) {
+    override def bladderState: BladderState = list.size match {
+      case 0 => BladderState.Empty
+      case maxEls => BladderState.Full
+      case _ => BladderState.Filling
+    }
+  }
+
+  def apply[A](maxEls: Int, os: OverflowStrategy, ordering: Ordering[A]): Flow[A, A, NotUsed] = {
+    MetamorphingFlow.apply[A, A, BladderList[A]](
+      init = BladderList(maxEls, List()),
+      os = os,
+      folding = { (el, state) =>
+          state.copy(list = (state.list :+ el).sorted(ordering)) },
+      unfolding = { (state) =>
+          (state.head, state.copy(list.tail)) })
+  }
+}
+```
